@@ -1,0 +1,225 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+import math
+import random
+from copy import copy
+
+import numpy as np
+import torch.nn as nn
+
+from ultralytics.data import build_dataloader, build_yolo_dataset
+from ultralytics.engine.trainer import BaseTrainer
+from ultralytics.models import yolo
+from ultralytics.nn.tasks import DetectionModel, DualStreamDetectionModel, yaml_model_load
+from ultralytics.utils import LOGGER, RANK
+from ultralytics.utils.plotting import plot_images, plot_labels, plot_results
+from ultralytics.utils.torch_utils import de_parallel, torch_distributed_zero_first
+
+
+class DetectionTrainer(BaseTrainer):
+    """
+    A class extending the BaseTrainer class for training based on a detection model.
+
+    Example:
+        ```python
+        from ultralytics.models.yolo.detect import DetectionTrainer
+
+        args = dict(model="yolo11n.pt", data="coco8.yaml", epochs=3)
+        trainer = DetectionTrainer(overrides=args)
+        trainer.train()
+        ```
+    """
+
+    def build_dataset(self, img_path, mode="train", batch=None):
+        """
+        Build YOLO Dataset.
+
+        Args:
+            img_path (str): Path to the folder containing images.
+            mode (str): `train` mode or `val` mode, users are able to customize different augmentations for each mode.
+            batch (int, optional): Size of batches, this is for `rect`. Defaults to None.
+        """
+        gs = max(int(de_parallel(self.model).stride.max() if self.model else 0), 32)
+        return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, rect=mode == "val", stride=gs)
+
+    def get_dataloader(self, dataset_path, batch_size=16, rank=0, mode="train"):
+        """Construct and return dataloader."""
+        assert mode in {"train", "val"}, f"Mode must be 'train' or 'val', not {mode}."
+        with torch_distributed_zero_first(rank):  # init dataset *.cache only once if DDP
+            dataset = self.build_dataset(dataset_path, mode, batch_size)
+        shuffle = mode == "train"
+        if getattr(dataset, "rect", False) and shuffle:
+            LOGGER.warning("WARNING ⚠️ 'rect=True' is incompatible with DataLoader shuffle, setting shuffle=False")
+            shuffle = False
+        workers = self.args.workers if mode == "train" else self.args.workers * 2
+        return build_dataloader(dataset, batch_size, workers, shuffle, rank)  # return dataloader
+
+    def preprocess_batch(self, batch):
+        """Preprocesses a batch of images by scaling and converting to float."""
+        batch["img"] = batch["img"].to(self.device, non_blocking=True).float() / 255
+        if self.args.multi_scale:
+            imgs = batch["img"]
+            sz = (
+                random.randrange(int(self.args.imgsz * 0.5), int(self.args.imgsz * 1.5 + self.stride))
+                // self.stride
+                * self.stride
+            )  # size
+            sf = sz / max(imgs.shape[2:])  # scale factor
+            if sf != 1:
+                ns = [
+                    math.ceil(x * sf / self.stride) * self.stride for x in imgs.shape[2:]
+                ]  # new shape (stretched to gs-multiple)
+                imgs = nn.functional.interpolate(imgs, size=ns, mode="bilinear", align_corners=False)
+            batch["img"] = imgs
+        
+        # 处理单模态输入 (RGBT-3M/FLAME2 为 6 通道输入, 根据input_mode进行切片)
+        input_mode = self.data.get("input_mode", "dual_input")
+        if batch["img"].shape[1] == 6 and input_mode != "dual_input":
+            # 备份完整的 6 通道数据用于可视化 (0:3 为 IR, 3:6 为 RGB)
+            batch["img_full"] = batch["img"].clone()
+            # 为模型输入进行切片
+            if input_mode == "rgb_input":
+                batch["img"] = batch["img"][:, 3:6, ...] # 仅保留 RGB 通道
+                if not hasattr(self, "_debug_rgb_saved"):
+                    import cv2
+                    import numpy as np
+                    from pathlib import Path
+                    save_path = Path(self.save_dir) / "debug_input_mode"
+                    save_path.mkdir(parents=True, exist_ok=True)
+                    imgs_np = (
+                        batch["img"][:4]
+                        .detach()
+                        .cpu()
+                        .numpy()
+                        .transpose(0, 2, 3, 1)
+                    )
+                    imgs_np = (imgs_np * 255.0).astype(np.uint8)
+                    for i, img_np in enumerate(imgs_np):
+                        cv2.imwrite(
+                            str(save_path / f"rgb_input_img{i}.jpg"),
+                            img_np[:, :, ::-1],
+                        )
+                    self._debug_rgb_saved = True
+            elif input_mode == "ir_input":
+                batch["img"] = batch["img"][:, 0:3, ...] # 仅保留 IR 通道
+                if not hasattr(self, "_debug_ir_saved"):
+                    import cv2
+                    import numpy as np
+                    from pathlib import Path
+                    save_path = Path(self.save_dir) / "debug_input_mode"
+                    save_path.mkdir(parents=True, exist_ok=True)
+                    imgs_np = (
+                        batch["img"][:4]
+                        .detach()
+                        .cpu()
+                        .numpy()
+                        .transpose(0, 2, 3, 1)
+                    )
+                    imgs_np = (imgs_np * 255.0).astype(np.uint8)
+                    for i, img_np in enumerate(imgs_np):
+                        cv2.imwrite(
+                            str(save_path / f"ir_input_img{i}.jpg"),
+                            img_np[:, :, ::-1],
+                        )
+                    self._debug_ir_saved = True
+            
+        # 打印模型输入的形状（第一 epoch 的第一个 batch，特别是 RGBT-3M）
+        if self.epoch == self.start_epoch and not hasattr(self, "_rgbt3m_shape_printed"):
+            if self.data.get("name") == "RGBT-3M":
+                LOGGER.info(f"\n[RGBT-3M] Epoch {self.epoch} - Model input shape: {batch['img'].shape}")
+                self._rgbt3m_shape_printed = True
+        elif not hasattr(self, "_last_printed_epoch") or self._last_printed_epoch != self.epoch:
+            LOGGER.info(f"\nEpoch {self.epoch} - Model input shape: {batch['img'].shape}")
+            self._last_printed_epoch = self.epoch
+            
+        return batch
+
+    def set_model_attributes(self):
+        """Nl = de_parallel(self.model).model[-1].nl  # number of detection layers (to scale hyps)."""
+        # self.args.box *= 3 / nl  # scale to layers
+        # self.args.cls *= self.data["nc"] / 80 * 3 / nl  # scale to classes and layers
+        # self.args.cls *= (self.args.imgsz / 640) ** 2 * 3 / nl  # scale to image size and layers
+        self.model.nc = self.data["nc"]  # attach number of classes to model
+        self.model.names = self.data["names"]  # attach class names to model
+        self.model.args = self.args  # attach hyperparameters to model
+        # TODO: self.model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc
+
+    def get_model(self, cfg=None, weights=None, verbose=True):
+        """Return a YOLO detection model."""
+        input_mode = self.data.get("input_mode", "dual_input")
+        ch = 6 if input_mode == "dual_input" else 3
+
+        # 检查 YAML 是否指定双分支模式
+        yaml_cfg = yaml_model_load(cfg) if isinstance(cfg, str) else cfg
+        use_dual_stream = yaml_cfg.get("dual_stream", False) if yaml_cfg else False
+
+        if use_dual_stream and input_mode == "dual_input":
+            model = DualStreamDetectionModel(cfg, ch=ch, nc=self.data["nc"], verbose=verbose and RANK == -1)
+        else:
+            model = DetectionModel(cfg, ch=ch, nc=self.data["nc"], verbose=verbose and RANK == -1)
+        if weights:
+            model.load(weights)
+        return model
+
+    def get_validator(self):
+        """Returns a DetectionValidator for YOLO model validation."""
+        self.loss_names = "box_loss", "cls_loss", "dfl_loss"
+        validator = yolo.detect.DetectionValidator(
+            self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
+        )
+        validator.data = self.data
+        validator.names = self.data.get("names")
+        return validator
+
+    def label_loss_items(self, loss_items=None, prefix="train"):
+        """
+        Returns a loss dict with labelled training loss items tensor.
+
+        Not needed for classification but necessary for segmentation & detection
+        """
+        keys = [f"{prefix}/{x}" for x in self.loss_names]
+        if loss_items is not None:
+            loss_items = [round(float(x), 5) for x in loss_items]  # convert tensors to 5 decimal place floats
+            return dict(zip(keys, loss_items))
+        else:
+            return keys
+
+    def progress_string(self):
+        """Returns a formatted string of training progress with epoch, GPU memory, loss, instances and size."""
+        return ("\n" + "%11s" * (4 + len(self.loss_names))) % (
+            "Epoch",
+            "GPU_mem",
+            *self.loss_names,
+            "Instances",
+            "Size",
+        )
+
+    def plot_training_samples(self, batch, ni):
+        """Plots training samples with their annotations."""
+        plot_images(
+            images=batch.get("img_full", batch["img"]),
+            batch_idx=batch["batch_idx"],
+            cls=batch["cls"].squeeze(-1),
+            bboxes=batch["bboxes"],
+            paths=batch["im_file"],
+            fname=self.save_dir / f"train_epoch{self.epoch}_batch{ni}.jpg",
+            on_plot=self.on_plot,
+            input_mode=self.data.get("input_mode", "dual_input"),
+        )
+
+    def plot_metrics(self):
+        """Plots metrics from a CSV file."""
+        plot_results(file=self.csv, on_plot=self.on_plot)  # save results.png
+
+    def plot_training_labels(self):
+        """Create a labeled training plot of the YOLO model."""
+        boxes = np.concatenate([lb["bboxes"] for lb in self.train_loader.dataset.labels], 0)
+        cls = np.concatenate([lb["cls"] for lb in self.train_loader.dataset.labels], 0)
+        plot_labels(boxes, cls.squeeze(), names=self.data["names"], save_dir=self.save_dir, on_plot=self.on_plot)
+
+    def auto_batch(self):
+        """Get batch size by calculating memory occupation of model."""
+        train_dataset = self.build_dataset(self.trainset, mode="train", batch=16)
+        # 4 for mosaic augmentation
+        max_num_obj = max(len(label["cls"]) for label in train_dataset.labels) * 4
+        return super().auto_batch(max_num_obj)

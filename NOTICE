@@ -1,0 +1,5 @@
+HieraFire builds on YOLOv12 (sunsmarterjie/yolov12) and Ultralytics
+(ultralytics/ultralytics). Upstream copyright and AGPL-3.0 notices are retained.
+The ultralytics Python namespace is preserved for checkpoint compatibility.
+Framework modules may contain support for other architectures; only the final
+HieraFire model configuration is distributed in this release.
