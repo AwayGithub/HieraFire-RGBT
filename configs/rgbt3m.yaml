@@ -1,0 +1,15 @@
+# RGBT-3M paired loader; --data-root overrides path.
+name: RGBT-3M
+path: /path/to/RGBT-3M
+train: train.txt
+val: val.txt
+nc: 2
+names: {0: fire, 1: person}
+input_channels: 6
+input_mode: dual_input
+rgb_dir: RGB
+thermal_dir: IR
+label_dir: labels_fire_person
+image_ext: .jpg
+img_size: [480, 640]
+format: yolo
